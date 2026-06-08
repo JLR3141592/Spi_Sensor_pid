@@ -4,11 +4,14 @@
 #include <SPI.h>         // Librería para manejar la interfaz de comunicación SPI con el sensor
 #include <Wire.h>        // Requerida como dependencia interna por varias librerías de sensores
 #include <PicoMQTT.h>    // Librería ligera para levantar un Broker/Servidor MQTT dentro del ESP32
+#include <WebServer.h>   // Servidor Web nativo del ESP32 para servir la interfaz gráfica
+#include <ArduinoJson.h> // Para empaquetar de forma eficiente la ruta JSON (/datos)
 
 //////////////////// MQTT ////////////////////
 
 PicoMQTT::Server mqtt;   // Instancia del servidor MQTT local que gestionará las conexiones
-String IP;               // Variable global para almacenar la IP en formato de texto legible
+String IP;    
+WebServer server(80);             // Variable global para almacenar la IP en formato de texto legible
 
 //////////////////// SPI ////////////////////
 
@@ -59,6 +62,116 @@ float dt;                  // Delta de tiempo real en segundos invertido en cada
 unsigned long tiempo_prev = 0; // Almacén del tiempo en milisegundos de la última iteración
 
 ///////////////////////////////////////////////////////
+// =============================================================================
+// RUTAS DEL SERVIDOR WEB
+// =============================================================================
+
+// 1. Ruta principal: HTML + CSS + JavaScript con Botón y envío síncronizado seguro
+void handleRoot() {
+  String html = R"rawliteral(
+  <!DOCTYPE html>
+  <html>
+  <head>
+      <title>Monitor ESP32 en Tiempo Real</title>
+      <meta charset="utf-8">
+      <style>
+          body { font-family: Arial, sans-serif; text-align: center; margin-top: 40px; background-color: #f4f4f9; }
+          .container { display: inline-block; background: white; padding: 30px; border-radius: 10px; box-shadow: 0px 4px 10px rgba(0,0,0,0.1); text-align: center; }
+          .dato { font-size: 24px; font-weight: bold; color: #333; margin: 15px 0; }
+          .eje-y { color: #3498db; }
+          
+          /* Estilos para el nuevo panel con botón */
+          .control-panel { margin-top: 25px; padding-top: 20px; border-top: 2px dashed #ddd; }
+          .control-panel input { padding: 10px; width: 110px; font-size: 18px; border: 2px solid #ccc; border-radius: 5px; text-align: center; }
+          .control-panel button { padding: 10px 20px; font-size: 18px; background-color: #3498db; color: white; border: none; border-radius: 5px; cursor: pointer; margin-left: 8px; font-weight: bold; }
+          .control-panel button:hover { background-color: #2980b9; }
+      </style>
+  </head>
+  <body>
+      <div class="container">
+          <h2>Telemetría del ESP32</h2>
+          <hr>
+          <div class="dato">Valor Eje Y: <span class="eje-y" id="valor-y">Cargando...</span></div>
+          <div class="dato" style="font-size: 18px; color: #666;">Confirmación Broker ("num"): <span id="valor-num">0.00</span></div>
+          
+          <div class="control-panel">
+              <label style="display:block; margin-bottom:8px; color:#555; font-size:15px;"><b>Enviar comando al topic 'lectura':</b></label>
+              <input type="number" id="input-num" value="0" step="any">
+              <button onclick="solicitarEnvio()">Publicar</button>
+          </div>
+          
+          <p><small style="color: #777;">Actualización de pantalla: cada 100ms.</small></p>
+      </div>
+
+      <script>
+          // Variable temporal que almacena el dato listo para irse
+          let comandoPendiente = null;
+
+          // Al presionar el botón, solo guardamos el valor completo aquí
+          function solicitarEnvio() {
+              let cajaTexto = document.getElementById('input-num');
+              let valor = cajaTexto.value;
+              
+              if (valor !== "" && !isNaN(valor)) {
+                  comandoPendiente = valor; 
+                  console.log("Comando en cola para el próximo ciclo HTTP: " + valor);
+              } else {
+                  alert("Por favor ingresa un número válido.");
+              }
+          }
+
+          function cicloBidireccional() {
+              let url = '/datos';
+              
+              // Si el botón fue presionado, acoplamos el parámetro al viaje actual
+              if (comandoPendiente !== null) {
+                  url += '?val=' + comandoPendiente;
+                  comandoPendiente = null; // Se limpia inmediatamente para que no se repita en el próximo bucle
+              }
+
+              fetch(url)
+                  .then(response => response.json())
+                  .then(data => {
+                      document.getElementById('valor-y').innerText = data.y;
+                      document.getElementById('valor-num').innerText = data.num;
+                  })
+                  .catch(error => console.error('Error en enlace de datos:', error));
+          }
+
+          // Consulta constante cada 100 milisegundos
+          setInterval(cicloBidireccional, 100);
+      </script>
+  </body>
+  </html>
+  )rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+// 2. Ruta API Única: Procesa el envío eventual del botón y retorna estados
+void handleDatos() {
+  // Si la web anexó un valor (porque se clickeó el botón), se publica una única vez
+  if (server.hasArg("val")) {
+    String textoWeb = server.arg("val");
+    ref = textoWeb.toFloat(); // Actualiza de inmediato la variable en memoria
+    
+    mqtt.publish("lectura", textoWeb.c_str()); // Dispara el mensaje al ecosistema MQTT
+    Serial.print("-> [BOTÓN CHICK] MQTT Publicado en 'lectura': ");
+    Serial.println(ref);
+  }
+
+  // Despacho de JSON estándar hacia el navegador
+  JsonDocument doc; 
+  doc["y"] = String(ang_y, 2);
+  doc["num"] = String(ref, 2); 
+
+  String respuestaJSON;
+  serializeJson(doc, respuestaJSON);
+  server.send(200, "application/json", respuestaJSON);
+}
+
+///////////////////////////////////////////////////////
+
 
 void setup() {
 
@@ -116,17 +229,24 @@ void setup() {
 
   ///////////////// MQTT /////////////////
 
-  mqtt.subscribe("angulo", [](const char * payload) {
+  mqtt.subscribe("lectura", [](const char* topic, const char* payload) {
     ref = atof(payload); // Parsea el string recibido a float inmediatamente
   });
 
   mqtt.begin(); // Enciende el servidor MQTT local
+
+  ///////////////// SERVIDOR WEB HTTP /////////////////
+  server.on("/", handleRoot);
+  server.on("/datos", handleDatos);
+  server.begin();
+  Serial.println("Servidor Web HTTP iniciado");
 }
 
 ///////////////////////////////////////////////////////
 
 void loop() {
 
+  server.handleClient(); // Procesa las peticiones HTTP entrantes del navegador
   mqtt.loop(); // Procesa paquetes de red MQTT de forma asíncrona
 
     ///////////////// LECTURA MPU /////////////////
@@ -170,9 +290,6 @@ void loop() {
 
     ///////////////// LIMITADOR DE ACCIÓN PWM /////////////////
 
-    // CORRECCIÓN 2: Acotado estricto al rango del hardware de control (0 a 255).
-    // NOTA: Si usas inversión de marcha (Puente H), aquí deberás evaluar el signo de 'u'
-    // para activar los pines de dirección correspondientes antes de aplicar el valor absoluto a analogWrite.
     if (u > 255.0) u = 255.0;
     if (u < 0.0)   u = 0.0; 
 
@@ -190,5 +307,4 @@ void loop() {
     Serial.println(ref);
     Serial.print(">accion_pwm:");
     Serial.println(u);
-    delay(2);
 }
