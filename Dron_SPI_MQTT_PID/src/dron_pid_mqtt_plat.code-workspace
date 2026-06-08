@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "dron_pid_mqtt_plat",
+			"path": "../../dron_pid_mqtt_plat"
+		},
+		{
+			"name": "Dron_mqtt_PID",
+			"path": "../../Dron_mqtt_PID"
+		}
+	],
+	"settings": {}
+}
